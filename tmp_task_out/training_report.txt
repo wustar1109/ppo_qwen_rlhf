@@ -1,0 +1,13 @@
+Adaptive training report
+==================================================
+
+Best reward: -inf
+Total steps: 3
+Final LR: 1.00e-05
+Final KL: 0.1000
+Final Clip: 0.2000
+Final Entropy: 0.0100
+
+Reward weights:
+  Human: 0.7000
+  Aesthetic: 0.3000
