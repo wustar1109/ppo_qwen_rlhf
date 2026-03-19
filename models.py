@@ -123,6 +123,10 @@ class PPOConfig:
     task_enable_negative_repair: bool = True
     task_enable_sampling_repair: bool = True
     task_continue_on_fail: bool = True
+    task_mode_only: bool = False
+    task_output_dir: Optional[str] = None
+    task_export_learning_data: bool = False
+    task_disable_training: bool = True
 
     output_dir: str = "./ppo_qwen_output"
     checkpoint_dir: str = "./checkpoints"
@@ -305,6 +309,7 @@ class PPOMemory:
 
     def __len__(self):
         return len(self.states)
+
 
 
 

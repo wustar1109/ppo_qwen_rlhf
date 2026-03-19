@@ -138,6 +138,10 @@ def parse_args():
     parser.add_argument("--task_enable_negative_repair", type=str2bool, default=True)
     parser.add_argument("--task_enable_sampling_repair", type=str2bool, default=True)
     parser.add_argument("--task_continue_on_fail", type=str2bool, default=True)
+    parser.add_argument("--task_mode_only", type=str2bool, default=False)
+    parser.add_argument("--task_output_dir", type=str, default=None)
+    parser.add_argument("--task_export_learning_data", type=str2bool, default=False)
+    parser.add_argument("--task_disable_training", type=str2bool, default=True)
 
     # Output config
     parser.add_argument("--output_dir", type=str, default="./ppo_qwen_output")
@@ -255,6 +259,10 @@ def get_config_from_args(args):
         task_enable_negative_repair=args.task_enable_negative_repair,
         task_enable_sampling_repair=args.task_enable_sampling_repair,
         task_continue_on_fail=args.task_continue_on_fail,
+        task_mode_only=args.task_mode_only,
+        task_output_dir=args.task_output_dir,
+        task_export_learning_data=args.task_export_learning_data,
+        task_disable_training=args.task_disable_training,
 
         output_dir=args.output_dir,
         checkpoint_dir=args.checkpoint_dir,
@@ -271,6 +279,7 @@ def get_config_from_args(args):
         lora_dropout=args.lora_dropout,
     )
     return config
+
 
 
 

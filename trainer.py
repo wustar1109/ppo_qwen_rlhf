@@ -1123,6 +1123,15 @@ class AdaptivePPOTrainer:
             except Exception:
                 pass
 
+        logger.info(
+            "Task start prompt_id=%s row=%s max_retry=%s pass_threshold=%.4f source=%s",
+            task_id,
+            row_index,
+            max_retry,
+            pass_threshold,
+            threshold_source,
+        )
+
         sampling = self._task_sampling_defaults()
         if current_negative:
             sampling["negative_prompt"] = current_negative
@@ -1149,6 +1158,16 @@ class AdaptivePPOTrainer:
                 generation_kwargs.pop("negative_prompt", None)
             if not generation_kwargs.get("seed"):
                 generation_kwargs["seed"] = random.randint(1, 2_147_483_647)
+
+            logger.info(
+                "Task prompt_id=%s attempt=%d/%d seed=%s steps=%s guidance=%s",
+                task_id,
+                attempt_idx,
+                max_retry,
+                generation_kwargs.get("seed"),
+                generation_kwargs.get("num_inference_steps"),
+                generation_kwargs.get("guidance_scale"),
+            )
 
             generated_image = None
             image_path = None
@@ -1223,6 +1242,15 @@ class AdaptivePPOTrainer:
             )
             passed = len(fail_reasons) == 0
 
+            logger.info(
+                "Task prompt_id=%s attempt=%d reward=%.4f passed=%s fail_reasons=%s",
+                task_id,
+                attempt_idx,
+                qwen_reward,
+                passed,
+                ",".join(fail_reasons) if fail_reasons else "none",
+            )
+
             scores = eval_item.get("scores", {}) if isinstance(eval_item, dict) else {}
             confidence = eval_item.get("confidence") if isinstance(eval_item, dict) else None
             labels = eval_item.get("labels", []) if isinstance(eval_item, dict) else []
@@ -1259,6 +1287,13 @@ class AdaptivePPOTrainer:
                         fail_reasons=fail_reasons,
                     )
                     used_repair_types.append(str(repair_action.get("repair_type")))
+                    logger.info(
+                        "Task prompt_id=%s attempt=%d repair=%s source=%s",
+                        task_id,
+                        attempt_idx,
+                        repair_action.get("repair_type"),
+                        repair_action.get("repair_source"),
+                    )
 
                     if current_prompt != prev_prompt:
                         pending_evolution = {
@@ -1987,6 +2022,7 @@ class AdaptivePPOTrainer:
             self.adaptive_controller.best_reward = optimizer_state.get('best_reward', float('-inf'))
 
         logger.info(f"Checkpoint loaded from {checkpoint_path}")
+
 
 
 

@@ -1,0 +1,3 @@
+﻿prompt_id,prompt,target_score,max_retry,negative_prompt,category,notes
+p001,"A clean grayscale abstract wave with smooth edges and no noise",0.55,5,"noise, dirty edge, severe artifact",grayscale,mvp sample
+p002,"Macro shot of smooth sinusoidal line texture in soft gray tones",0.60,4,"blurry, broken line, low quality",linework,mvp sample
