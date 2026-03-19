@@ -52,6 +52,45 @@ def _filter_run(records: Iterable[Dict[str, Any]], run_id: Optional[str]) -> Lis
     return [r for r in records if str(r.get("run_id") or "") == str(run_id)]
 
 
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _is_judge_valid_record(rec: Dict[str, Any]) -> bool:
+    if not isinstance(rec, dict):
+        return False
+
+    judge_status = str(rec.get("qwen_judge_status") or rec.get("judge_status") or "")
+    if judge_status != "ok":
+        return False
+
+    parse_success = rec.get("qwen_parse_success")
+    if parse_success is False:
+        return False
+
+    schema_valid = rec.get("qwen_schema_valid")
+    if schema_valid is False:
+        return False
+
+    scores = rec.get("qwen_scores")
+    if not isinstance(scores, dict):
+        return False
+
+    for key in ("aesthetic", "gray_smoothness", "noise_artifact", "prompt_alignment"):
+        if _safe_float(scores.get(key)) is None:
+            return False
+
+    if rec.get("qwen_reward") is None:
+        return False
+
+    return True
+
+
 def _build_prompt_optimizer_rows(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for rec in records:
@@ -128,8 +167,10 @@ def _build_preference_rows(records: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if len(attempts) < 2:
             continue
         for left, right in combinations(attempts, 2):
-            l_reward = float(left.get("qwen_reward") or 0.0)
-            r_reward = float(right.get("qwen_reward") or 0.0)
+            l_reward = _safe_float(left.get("qwen_reward"))
+            r_reward = _safe_float(right.get("qwen_reward"))
+            if l_reward is None or r_reward is None:
+                continue
             if l_reward == r_reward:
                 continue
 
@@ -171,38 +212,55 @@ def export_learning_datasets(
         raise RuntimeError("eval_output_dir is required")
 
     source_path = os.path.join(eval_output_dir, "task_run_records.jsonl")
-    records = _filter_run(_iter_jsonl(source_path), run_id)
+    all_records = _filter_run(_iter_jsonl(source_path), run_id)
+
+    valid_records: List[Dict[str, Any]] = []
+    invalid_records: List[Dict[str, Any]] = []
+    for rec in all_records:
+        if _is_judge_valid_record(rec):
+            valid_records.append(rec)
+        else:
+            invalid_records.append(rec)
 
     if output_dir is None:
         output_dir = os.path.join(eval_output_dir, "learning_data")
     os.makedirs(output_dir, exist_ok=True)
 
-    prompt_rows = _build_prompt_optimizer_rows(records)
-    reward_rows = _build_reward_model_rows(records)
-    pref_rows = _build_preference_rows(records)
+    prompt_rows = _build_prompt_optimizer_rows(valid_records)
+    reward_rows = _build_reward_model_rows(valid_records)
+    pref_rows = _build_preference_rows(valid_records)
 
     prompt_path = os.path.join(output_dir, "prompt_optimizer_train.jsonl")
     reward_path = os.path.join(output_dir, "reward_model_train.jsonl")
     pref_path = os.path.join(output_dir, "preference_train.jsonl")
+    invalid_path = os.path.join(output_dir, "invalid_judge_records.jsonl")
 
     prompt_count = _write_jsonl(prompt_path, prompt_rows)
     reward_count = _write_jsonl(reward_path, reward_rows)
     pref_count = _write_jsonl(pref_path, pref_rows)
+    invalid_count = _write_jsonl(invalid_path, invalid_records)
 
     summary = {
         "run_id": run_id,
         "source_path": source_path,
         "output_dir": output_dir,
+        "source_records": len(all_records),
+        "valid_records": len(valid_records),
+        "invalid_records": len(invalid_records),
         "prompt_optimizer_samples": prompt_count,
         "reward_model_samples": reward_count,
         "preference_samples": pref_count,
+        "invalid_judge_records": invalid_count,
         "prompt_optimizer_path": prompt_path,
         "reward_model_path": reward_path,
         "preference_path": pref_path,
+        "invalid_judge_path": invalid_path,
     }
 
     logger.info(
-        "Exported learning datasets: prompt_optimizer=%d reward=%d preference=%d",
+        "Exported learning datasets: valid=%d invalid=%d prompt_optimizer=%d reward=%d preference=%d",
+        len(valid_records),
+        len(invalid_records),
         prompt_count,
         reward_count,
         pref_count,

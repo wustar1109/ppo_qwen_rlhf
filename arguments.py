@@ -65,6 +65,10 @@ def parse_args():
     parser.add_argument("--qwen_judge_device", type=str, default=None)
     parser.add_argument("--qwen_judge_local_files_only", type=parse_tristate_bool, default=None)
     parser.add_argument("--qwen_judge_trust_remote_code", type=str2bool, default=True)
+    parser.add_argument("--qwen_judge_log_raw_output", type=str2bool, default=True)
+    parser.add_argument("--qwen_judge_strict_schema", type=str2bool, default=False)
+    parser.add_argument("--qwen_judge_retry_on_invalid", type=str2bool, default=True)
+    parser.add_argument("--qwen_judge_max_retry", type=int, default=1)
     parser.add_argument("--qwen_judge_system_prompt", type=str, default=DEFAULT_QWEN_SYSTEM_PROMPT)
     parser.add_argument("--qwen_judge_prompt_version", type=str, default="v1")
     parser.add_argument("--qwen_judge_max_new_tokens", type=int, default=512)
@@ -191,6 +195,10 @@ def get_config_from_args(args):
         qwen_judge_device=args.qwen_judge_device,
         qwen_judge_local_files_only=args.qwen_judge_local_files_only,
         qwen_judge_trust_remote_code=args.qwen_judge_trust_remote_code,
+        qwen_judge_log_raw_output=args.qwen_judge_log_raw_output,
+        qwen_judge_strict_schema=args.qwen_judge_strict_schema,
+        qwen_judge_retry_on_invalid=args.qwen_judge_retry_on_invalid,
+        qwen_judge_max_retry=args.qwen_judge_max_retry,
         qwen_judge_system_prompt=args.qwen_judge_system_prompt,
         qwen_judge_prompt_version=args.qwen_judge_prompt_version,
         qwen_judge_max_new_tokens=args.qwen_judge_max_new_tokens,
@@ -279,6 +287,7 @@ def get_config_from_args(args):
         lora_dropout=args.lora_dropout,
     )
     return config
+
 
 
 

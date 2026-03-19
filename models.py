@@ -40,6 +40,10 @@ class PPOConfig:
     qwen_judge_device: Optional[str] = None
     qwen_judge_local_files_only: Optional[bool] = None
     qwen_judge_trust_remote_code: bool = True
+    qwen_judge_log_raw_output: bool = True
+    qwen_judge_strict_schema: bool = False
+    qwen_judge_retry_on_invalid: bool = True
+    qwen_judge_max_retry: int = 1
     qwen_judge_system_prompt: str = (
         "You are a strict image quality judge. Return JSON only with fields: "
         "scores {aesthetic, gray_smoothness, noise_artifact, prompt_alignment} (1-10), critique, prompt_optimization."
@@ -309,6 +313,7 @@ class PPOMemory:
 
     def __len__(self):
         return len(self.states)
+
 
 
 

@@ -191,6 +191,10 @@ class AdaptivePPOTrainer:
         self._seen_human_reviews = set()
         self._eval_cache = {}
         self.qwen_pairwise_every = max(0, int(getattr(config, "qwen_pairwise_every", self.qwen_eval_every) or 0))
+        self.qwen_judge_retry_on_invalid = bool(getattr(config, "qwen_judge_retry_on_invalid", True))
+        self.qwen_judge_max_retry = max(0, int(getattr(config, "qwen_judge_max_retry", 1) or 0))
+        self.qwen_judge_log_raw_output = bool(getattr(config, "qwen_judge_log_raw_output", True))
+        self.qwen_judge_strict_schema = bool(getattr(config, "qwen_judge_strict_schema", False))
 
         # Task queue mode
         self.task_pass_threshold = float(getattr(config, "task_pass_threshold", 0.5))
@@ -334,6 +338,8 @@ class AdaptivePPOTrainer:
             top_p=getattr(self.config, "qwen_judge_top_p", 0.9),
             local_files_only=local_files_only,
             trust_remote_code=trust_remote_code,
+            log_raw_output=getattr(self.config, "qwen_judge_log_raw_output", True),
+            strict_schema=getattr(self.config, "qwen_judge_strict_schema", False),
         )
         logger.info("Qwen judge initialized on %s", judge_device)
 
@@ -342,15 +348,31 @@ class AdaptivePPOTrainer:
         confidences = []
         gate_hits = []
         base_scores = []
+        judge_statuses = []
+        judge_valid_flags = []
+
         for result in eval_results:
             scores = result.get("scores", {}) if isinstance(result, dict) else {}
-            aesthetic = float(scores.get("aesthetic") or 0.0)
-            gray = float(scores.get("gray_smoothness") or 0.0)
-            noise = float(scores.get("noise_artifact") or 0.0)
-            alignment = float(scores.get("prompt_alignment") or 0.0)
+            judge_status = str(result.get("judge_status") or "ok") if isinstance(result, dict) else "runtime_error"
+            aesthetic = self._safe_float(scores.get("aesthetic"), None)
+            gray = self._safe_float(scores.get("gray_smoothness"), None)
+            noise = self._safe_float(scores.get("noise_artifact"), None)
+            alignment = self._safe_float(scores.get("prompt_alignment"), None)
             conf = result.get("confidence") if isinstance(result, dict) else None
             labels = result.get("labels", []) if isinstance(result, dict) else []
             labels = set([str(label) for label in labels if label is not None])
+
+            score_missing = any(v is None for v in (aesthetic, gray, noise, alignment))
+            judge_valid = judge_status == "ok" and not score_missing
+
+            if not judge_valid:
+                rewards.append(0.0)
+                confidences.append(0.0 if conf is None else float(conf))
+                gate_hits.append(0.0)
+                base_scores.append(0.0)
+                judge_statuses.append(judge_status)
+                judge_valid_flags.append(0.0)
+                continue
 
             gate_hit = False
             if aesthetic < self.qwen_gate_min_aesthetic:
@@ -380,7 +402,7 @@ class AdaptivePPOTrainer:
                 conf_scale = 1.0
                 conf_value = 1.0
             else:
-                conf_value = float(conf)
+                conf_value = self._safe_float(conf, 0.0)
                 if conf_value < self.qwen_confidence_low:
                     conf_scale = 0.0
                 elif conf_value >= self.qwen_confidence_high:
@@ -394,6 +416,8 @@ class AdaptivePPOTrainer:
             confidences.append(conf_value)
             gate_hits.append(1.0 if gate_hit else 0.0)
             base_scores.append(base_score)
+            judge_statuses.append(judge_status)
+            judge_valid_flags.append(1.0)
 
         if not rewards:
             rewards = [0.0]
@@ -403,6 +427,8 @@ class AdaptivePPOTrainer:
             "gate_hit": gate_hits,
             "base_score": base_scores,
             "reward": rewards,
+            "judge_status": judge_statuses,
+            "judge_valid": judge_valid_flags,
         }
         if return_meta:
             return tensor, meta
@@ -493,6 +519,12 @@ class AdaptivePPOTrainer:
                 "labels": labels,
                 "critique": eval_item.get("critique") if isinstance(eval_item, dict) else None,
                 "prompt_optimization": eval_item.get("prompt_optimization") if isinstance(eval_item, dict) else None,
+                "qwen_judge_status": eval_item.get("judge_status") if isinstance(eval_item, dict) else None,
+                "qwen_raw_response_text": eval_item.get("raw_response_text") if isinstance(eval_item, dict) else None,
+                "qwen_parse_success": eval_item.get("parse_success") if isinstance(eval_item, dict) else None,
+                "qwen_parse_error": eval_item.get("parse_error") if isinstance(eval_item, dict) else None,
+                "qwen_schema_valid": eval_item.get("schema_valid") if isinstance(eval_item, dict) else None,
+                "qwen_schema_error": eval_item.get("schema_error") if isinstance(eval_item, dict) else None,
                 "qwen_reward": qwen_reward,
                 "qwen_base_score": qwen_base_score,
                 "qwen_gate_hit": qwen_gate_hit,
@@ -848,67 +880,167 @@ class AdaptivePPOTrainer:
                 terms.append(term)
         return ", ".join(terms)
 
-    def _evaluate_single_qwen(self, image: Image.Image, prompt_text: str) -> Tuple[Dict[str, Any], float, Dict[str, Any], Optional[str]]:
+    def _is_qwen_judge_valid(self, eval_item: Dict[str, Any]) -> bool:
+        if not isinstance(eval_item, dict):
+            return False
+        if str(eval_item.get("judge_status") or "") != "ok":
+            return False
+        scores = eval_item.get("scores")
+        if not isinstance(scores, dict):
+            return False
+        for key in ("aesthetic", "gray_smoothness", "noise_artifact", "prompt_alignment"):
+            if self._safe_float(scores.get(key), None) is None:
+                return False
+        return True
+
+    def _judge_status_reason(self, status: str) -> str:
+        status = str(status or "runtime_error")
+        mapping = {
+            "empty_response": "judge_empty_response",
+            "json_parse_failed": "judge_parse_failed",
+            "schema_invalid": "judge_schema_invalid",
+            "runtime_error": "judge_runtime_error",
+            "ok": "judge_ok",
+        }
+        return mapping.get(status, f"judge_{status}")
+    def _evaluate_single_qwen(self, image: Image.Image, prompt_text: str) -> Tuple[Dict[str, Any], Optional[float], Dict[str, Any], Optional[str]]:
         if self.qwen_judge is None:
             fallback = {
                 "raw_text": None,
+                "raw_response_text": None,
                 "scores": {},
                 "confidence": None,
                 "labels": [],
                 "critique": "qwen_judge_not_enabled",
                 "prompt_optimization": None,
+                "parse_success": False,
+                "parse_error": "qwen_judge_not_enabled",
+                "schema_valid": False,
+                "schema_error": "qwen_judge_not_enabled",
+                "judge_status": "runtime_error",
             }
             meta = {
                 "confidence": [0.0],
-                "gate_hit": [1.0],
+                "gate_hit": [0.0],
                 "base_score": [0.0],
                 "reward": [0.0],
+                "judge_status": ["runtime_error"],
+                "judge_valid": [0.0],
             }
-            return fallback, 0.0, meta, "qwen_judge_not_enabled"
+            return fallback, None, meta, "qwen_judge_not_enabled"
 
-        try:
-            eval_item = self.qwen_judge.evaluate(image, prompt_text)
-        except Exception as exc:
-            fallback = {
+        max_retry = self.qwen_judge_max_retry if self.qwen_judge_retry_on_invalid else 0
+        total_attempts = max(1, 1 + int(max_retry))
+
+        last_item: Optional[Dict[str, Any]] = None
+        last_error: Optional[str] = None
+
+        for attempt in range(total_attempts):
+            try:
+                eval_item = self.qwen_judge.evaluate(image, prompt_text)
+            except Exception as exc:
+                eval_item = {
+                    "raw_text": None,
+                    "raw_response_text": None,
+                    "scores": {},
+                    "confidence": None,
+                    "labels": [],
+                    "critique": f"qwen_judge_error: {exc}",
+                    "prompt_optimization": None,
+                    "parse_success": False,
+                    "parse_error": str(exc),
+                    "schema_valid": False,
+                    "schema_error": None,
+                    "judge_status": "runtime_error",
+                }
+                last_error = str(exc)
+
+            last_item = eval_item
+            judge_status = str(eval_item.get("judge_status") or "runtime_error")
+            if self._is_qwen_judge_valid(eval_item):
+                try:
+                    qwen_rewards, qwen_meta = self._compute_qwen_reward([eval_item], torch.device("cpu"), return_meta=True)
+                    qwen_reward = float(qwen_rewards.detach().cpu().view(-1)[0].item())
+                except Exception as exc:
+                    qwen_reward = None
+                    qwen_meta = {
+                        "confidence": [self._safe_float(eval_item.get("confidence"), 0.0)],
+                        "gate_hit": [0.0],
+                        "base_score": [0.0],
+                        "reward": [0.0],
+                        "judge_status": [judge_status],
+                        "judge_valid": [0.0],
+                    }
+                    return eval_item, qwen_reward, qwen_meta, f"qwen_reward_error: {exc}"
+                return eval_item, qwen_reward, qwen_meta, None
+
+            if attempt + 1 < total_attempts:
+                logger.warning(
+                    "Qwen judge invalid output on attempt %d/%d. status=%s parse_error=%s schema_error=%s. Retrying judge on same image.",
+                    attempt + 1,
+                    total_attempts,
+                    judge_status,
+                    eval_item.get("parse_error"),
+                    eval_item.get("schema_error"),
+                )
+
+        if last_item is None:
+            last_item = {
                 "raw_text": None,
+                "raw_response_text": None,
                 "scores": {},
                 "confidence": None,
                 "labels": [],
-                "critique": f"qwen_judge_error: {exc}",
+                "critique": None,
                 "prompt_optimization": None,
+                "parse_success": False,
+                "parse_error": "judge_unknown_error",
+                "schema_valid": False,
+                "schema_error": "judge_unknown_error",
+                "judge_status": "runtime_error",
             }
-            meta = {
-                "confidence": [0.0],
-                "gate_hit": [1.0],
-                "base_score": [0.0],
-                "reward": [0.0],
-            }
-            return fallback, 0.0, meta, str(exc)
 
-        try:
-            qwen_rewards, qwen_meta = self._compute_qwen_reward([eval_item], torch.device("cpu"), return_meta=True)
-            qwen_reward = float(qwen_rewards.detach().cpu().view(-1)[0].item())
-        except Exception as exc:
-            qwen_reward = 0.0
-            qwen_meta = {
-                "confidence": [self._safe_float(eval_item.get("confidence"), 0.0)],
-                "gate_hit": [1.0],
-                "base_score": [0.0],
-                "reward": [0.0],
-            }
-            return eval_item, qwen_reward, qwen_meta, f"qwen_reward_error: {exc}"
+        final_status = str(last_item.get("judge_status") or "runtime_error")
+        meta = {
+            "confidence": [self._safe_float(last_item.get("confidence"), 0.0)],
+            "gate_hit": [0.0],
+            "base_score": [0.0],
+            "reward": [0.0],
+            "judge_status": [final_status],
+            "judge_valid": [0.0],
+        }
 
-        return eval_item, qwen_reward, qwen_meta, None
+        final_error = last_error
+        if final_error is None:
+            final_error = self._judge_status_reason(final_status)
+        return last_item, None, meta, final_error
 
     def _build_fail_reasons(
         self,
         eval_item: Dict[str, Any],
-        qwen_reward: float,
+        qwen_reward: Optional[float],
         threshold: float,
         qwen_meta: Optional[Dict[str, Any]],
         judge_error: Optional[str],
     ) -> List[str]:
         reasons: List[str] = []
+        judge_status = str(eval_item.get("judge_status") or "runtime_error") if isinstance(eval_item, dict) else "runtime_error"
+
+        if judge_status != "ok" or not self._is_qwen_judge_valid(eval_item):
+            reasons.append("judge_invalid_output")
+            reasons.append(self._judge_status_reason(judge_status))
+            if judge_error:
+                reasons.append(str(judge_error))
+
+            dedup: List[str] = []
+            seen = set()
+            for r in reasons:
+                if r in seen:
+                    continue
+                seen.add(r)
+                dedup.append(r)
+            return dedup
+
         if judge_error:
             reasons.append(judge_error)
 
@@ -927,7 +1059,18 @@ class AdaptivePPOTrainer:
 
         fatal_labels = sorted(labels.intersection(self.qwen_fatal_labels)) if self.qwen_fatal_labels else []
 
-        if qwen_reward < threshold:
+        if qwen_reward is None:
+            reasons.append("judge_invalid_output")
+            reasons.append("judge_reward_missing")
+            dedup_missing: List[str] = []
+            seen_missing = set()
+            for r in reasons:
+                if r in seen_missing:
+                    continue
+                seen_missing.add(r)
+                dedup_missing.append(r)
+            return dedup_missing
+        elif qwen_reward < threshold:
             reasons.append("reward_below_threshold")
         if gate_hit:
             reasons.append("qwen_gate_hit")
@@ -950,7 +1093,6 @@ class AdaptivePPOTrainer:
             seen.add(r)
             dedup.append(r)
         return dedup
-
     def _auto_repair(
         self,
         current_prompt: str,
@@ -1146,7 +1288,7 @@ class AdaptivePPOTrainer:
         final_status = "failed"
         attempt_count = 0
         pending_evolution: Optional[Dict[str, Any]] = None
-        final_reward = 0.0
+        final_reward: Optional[float] = None
         final_scores: Dict[str, Any] = {}
 
         for attempt_idx in range(1, max_retry + 1):
@@ -1174,18 +1316,27 @@ class AdaptivePPOTrainer:
             extra: Dict[str, Any] = {}
             eval_item: Dict[str, Any] = {
                 "raw_text": None,
+                "raw_response_text": None,
                 "scores": {},
                 "confidence": None,
                 "labels": [],
                 "critique": None,
                 "prompt_optimization": None,
+                "parse_success": False,
+                "parse_error": None,
+                "schema_valid": False,
+                "schema_error": None,
+                "judge_status": "runtime_error",
+                "image_input_confirmed": None,
             }
-            qwen_reward = 0.0
+            qwen_reward: Optional[float] = None
             qwen_meta: Dict[str, Any] = {
                 "confidence": [0.0],
-                "gate_hit": [1.0],
+                "gate_hit": [0.0],
                 "base_score": [0.0],
                 "reward": [0.0],
+                "judge_status": ["runtime_error"],
+                "judge_valid": [0.0],
             }
             judge_error: Optional[str] = None
 
@@ -1211,24 +1362,37 @@ class AdaptivePPOTrainer:
                 judge_error = str(exc)
                 eval_item = {
                     "raw_text": None,
+                    "raw_response_text": None,
                     "scores": {},
                     "confidence": None,
                     "labels": [],
                     "critique": f"task_generation_error: {exc}",
                     "prompt_optimization": None,
+                    "parse_success": False,
+                    "parse_error": str(exc),
+                    "schema_valid": False,
+                    "schema_error": None,
+                    "judge_status": "runtime_error",
+                    "image_input_confirmed": None,
                 }
-                qwen_reward = -1.0
+                qwen_reward = None
                 qwen_meta = {
                     "confidence": [0.0],
-                    "gate_hit": [1.0],
+                    "gate_hit": [0.0],
                     "base_score": [0.0],
-                    "reward": [qwen_reward],
+                    "reward": [0.0],
+                    "judge_status": ["runtime_error"],
+                    "judge_valid": [0.0],
                 }
 
             if pending_evolution is not None:
                 evo = dict(pending_evolution)
                 evo["reward_after"] = qwen_reward
-                evo["accepted"] = bool(qwen_reward > self._safe_float(evo.get("reward_before"), float("-inf")))
+                prev_reward = evo.get("reward_before")
+                if qwen_reward is None or prev_reward is None:
+                    evo["accepted"] = False
+                else:
+                    evo["accepted"] = bool(float(qwen_reward) > float(prev_reward))
                 evo["timestamp"] = datetime.utcnow().isoformat() + "Z"
                 self._append_jsonl_record(self.prompt_evolution_path, evo)
                 pending_evolution = None
@@ -1242,11 +1406,12 @@ class AdaptivePPOTrainer:
             )
             passed = len(fail_reasons) == 0
 
+            reward_text = "None" if qwen_reward is None else f"{float(qwen_reward):.4f}"
             logger.info(
-                "Task prompt_id=%s attempt=%d reward=%.4f passed=%s fail_reasons=%s",
+                "Task prompt_id=%s attempt=%d reward=%s passed=%s fail_reasons=%s",
                 task_id,
                 attempt_idx,
-                qwen_reward,
+                reward_text,
                 passed,
                 ",".join(fail_reasons) if fail_reasons else "none",
             )
@@ -1256,6 +1421,9 @@ class AdaptivePPOTrainer:
             labels = eval_item.get("labels", []) if isinstance(eval_item, dict) else []
             critique = eval_item.get("critique") if isinstance(eval_item, dict) else None
             prompt_optimization = eval_item.get("prompt_optimization") if isinstance(eval_item, dict) else None
+            judge_status = str(eval_item.get("judge_status") or "runtime_error") if isinstance(eval_item, dict) else "runtime_error"
+            judge_valid = self._is_qwen_judge_valid(eval_item)
+
             final_reward = qwen_reward
             final_scores = scores if isinstance(scores, dict) else {}
 
@@ -1265,9 +1433,11 @@ class AdaptivePPOTrainer:
                     if key in extra:
                         sampling_used[key] = extra[key]
 
-            if qwen_reward > best_reward:
+            if qwen_reward is not None and qwen_reward > best_reward:
                 best_reward = qwen_reward
                 best_scores = scores if isinstance(scores, dict) else {}
+                best_image_path = image_path
+            elif best_image_path is None and image_path:
                 best_image_path = image_path
 
             repair_action: Dict[str, Any] = {
@@ -1277,7 +1447,27 @@ class AdaptivePPOTrainer:
             }
 
             if not passed and attempt_idx < max_retry:
-                if self.task_enable_auto_repair:
+                if not judge_valid:
+                    repair_action = {
+                        "repair_type": "judge_invalid_output",
+                        "repair_reason": self._judge_status_reason(judge_status),
+                        "repair_source": "judge_fallback",
+                        "judge_status": judge_status,
+                        "old_prompt": current_prompt,
+                        "new_prompt": current_prompt,
+                        "old_negative_prompt": current_negative,
+                        "new_negative_prompt": current_negative,
+                        "old_sampling": dict(sampling),
+                        "new_sampling": dict(sampling),
+                    }
+                    used_repair_types.append("judge_invalid_output")
+                    logger.warning(
+                        "Task prompt_id=%s attempt=%d judge invalid output (status=%s). Skip prompt-quality repair and continue.",
+                        task_id,
+                        attempt_idx,
+                        judge_status,
+                    )
+                elif self.task_enable_auto_repair:
                     prev_prompt = current_prompt
                     current_prompt, current_negative, sampling, repair_action = self._auto_repair(
                         current_prompt=current_prompt,
@@ -1339,6 +1529,13 @@ class AdaptivePPOTrainer:
                 "labels": labels,
                 "critique": critique,
                 "prompt_optimization": prompt_optimization,
+                "qwen_judge_status": judge_status,
+                "qwen_raw_response_text": eval_item.get("raw_response_text") if isinstance(eval_item, dict) else None,
+                "qwen_parse_success": eval_item.get("parse_success") if isinstance(eval_item, dict) else None,
+                "qwen_parse_error": eval_item.get("parse_error") if isinstance(eval_item, dict) else None,
+                "qwen_schema_valid": eval_item.get("schema_valid") if isinstance(eval_item, dict) else None,
+                "qwen_schema_error": eval_item.get("schema_error") if isinstance(eval_item, dict) else None,
+                "qwen_image_input_confirmed": eval_item.get("image_input_confirmed") if isinstance(eval_item, dict) else None,
                 "pass_threshold": pass_threshold,
                 "threshold_source": threshold_source,
                 "passed": passed,
@@ -1386,7 +1583,7 @@ class AdaptivePPOTrainer:
             "execution_count": attempt_count,
             "final_status": final_status,
             "final_reward": final_reward,
-            "final_score": final_reward,
+            "final_score": final_reward if final_reward is not None else best_reward,
             "final_scores": final_scores,
             "best_image_path": best_image_path,
             "best_reward": best_reward,
@@ -2022,6 +2219,19 @@ class AdaptivePPOTrainer:
             self.adaptive_controller.best_reward = optimizer_state.get('best_reward', float('-inf'))
 
         logger.info(f"Checkpoint loaded from {checkpoint_path}")
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
