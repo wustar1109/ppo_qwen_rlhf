@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import random
 import time
 from datetime import datetime
@@ -195,6 +196,7 @@ class AdaptivePPOTrainer:
         self.qwen_judge_max_retry = max(0, int(getattr(config, "qwen_judge_max_retry", 1) or 0))
         self.qwen_judge_log_raw_output = bool(getattr(config, "qwen_judge_log_raw_output", True))
         self.qwen_judge_strict_schema = bool(getattr(config, "qwen_judge_strict_schema", False))
+        self.qwen_noise_higher_is_worse = bool(getattr(config, "qwen_noise_higher_is_worse", True))
 
         # Task queue mode
         self.task_pass_threshold = float(getattr(config, "task_pass_threshold", 0.5))
@@ -205,6 +207,11 @@ class AdaptivePPOTrainer:
         self.task_enable_negative_repair = bool(getattr(config, "task_enable_negative_repair", True))
         self.task_enable_sampling_repair = bool(getattr(config, "task_enable_sampling_repair", True))
         self.task_continue_on_fail = bool(getattr(config, "task_continue_on_fail", True))
+        self.task_repair_low_score_max = float(getattr(config, "task_repair_low_score_max", 3.0))
+        self.task_repair_mid_score_max = float(getattr(config, "task_repair_mid_score_max", 6.0))
+        self.task_prompt_identity_guard = bool(getattr(config, "task_prompt_identity_guard", True))
+        self.task_prompt_identity_min_keep_ratio = float(getattr(config, "task_prompt_identity_min_keep_ratio", 0.6))
+        self.task_repair_use_original_anchor = bool(getattr(config, "task_repair_use_original_anchor", True))
 
         self.task_run_records_path = os.path.join(self.eval_output_dir, "task_run_records.jsonl")
         self.task_summary_path = os.path.join(self.eval_output_dir, "task_summary.jsonl")
@@ -356,7 +363,8 @@ class AdaptivePPOTrainer:
             judge_status = str(result.get("judge_status") or "ok") if isinstance(result, dict) else "runtime_error"
             aesthetic = self._safe_float(scores.get("aesthetic"), None)
             gray = self._safe_float(scores.get("gray_smoothness"), None)
-            noise = self._safe_float(scores.get("noise_artifact"), None)
+            noise_raw = self._safe_float(scores.get("noise_artifact"), None)
+            noise = self._normalize_noise_severity(noise_raw)
             alignment = self._safe_float(scores.get("prompt_alignment"), None)
             conf = result.get("confidence") if isinstance(result, dict) else None
             labels = result.get("labels", []) if isinstance(result, dict) else []
@@ -815,6 +823,16 @@ class AdaptivePPOTrainer:
         except Exception:
             return default
 
+    def _normalize_noise_severity(self, noise_artifact_score: Optional[float]) -> Optional[float]:
+        if noise_artifact_score is None:
+            return None
+        score = self._safe_float(noise_artifact_score, None)
+        if score is None:
+            return None
+        if self.qwen_noise_higher_is_worse:
+            return score
+        return max(1.0, 11.0 - score)
+
     def _task_sampling_defaults(self) -> Dict[str, Any]:
         defaults: Dict[str, Any] = {}
         backend = getattr(getattr(self, "z_image", None), "backend", None)
@@ -837,29 +855,241 @@ class AdaptivePPOTrainer:
         defaults["seed"] = random.randint(1, 2_147_483_647)
         return defaults
 
-    def _coerce_prompt_optimization_text(self, eval_item: Dict[str, Any]) -> Optional[str]:
-        if not isinstance(eval_item, dict):
-            return None
-        value = eval_item.get("prompt_optimization")
+    def _normalize_text_list(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        items: List[str] = []
         if isinstance(value, str):
             text = value.strip()
-            return text or None
-
-        if isinstance(value, dict):
-            for key in ("new_prompt", "optimized_prompt", "prompt", "text"):
-                v = value.get(key)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-                if isinstance(v, dict):
-                    nested = v.get("text") or v.get("prompt")
-                    if isinstance(nested, str) and nested.strip():
-                        return nested.strip()
-
-        if isinstance(value, list):
+            if text:
+                if "," in text:
+                    items.extend([part.strip() for part in text.split(",") if part.strip()])
+                else:
+                    items.append(text)
+        elif isinstance(value, list):
             for item in value:
-                if isinstance(item, str) and item.strip():
-                    return item.strip()
-        return None
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    items.append(text)
+        elif isinstance(value, dict):
+            for key in ("tokens", "items", "values", "list", "subject", "style"):
+                if key in value:
+                    items.extend(self._normalize_text_list(value.get(key)))
+
+        deduped: List[str] = []
+        seen = set()
+        for item in items:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _extract_prompt_optimization_payload(self, eval_item: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            "protected_subject_tokens": [],
+            "protected_style_tokens": [],
+            "must_keep_phrases": [],
+            "rewrite_candidate": "",
+            "append_constraints": "",
+            "forbidden_new_subject_tokens": [],
+            "reason": "",
+        }
+        if not isinstance(eval_item, dict):
+            return payload
+
+        raw = eval_item.get("prompt_optimization")
+        if raw is None:
+            return payload
+
+        if isinstance(raw, str):
+            payload["rewrite_candidate"] = raw.strip()
+            return payload
+
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, str) and item.strip() and not payload["rewrite_candidate"]:
+                    payload["rewrite_candidate"] = item.strip()
+                elif isinstance(item, dict):
+                    nested = self._extract_prompt_optimization_payload({"prompt_optimization": item})
+                    for key in ("protected_subject_tokens", "protected_style_tokens", "must_keep_phrases", "forbidden_new_subject_tokens"):
+                        payload[key].extend(nested.get(key, []))
+                    if nested.get("rewrite_candidate") and not payload["rewrite_candidate"]:
+                        payload["rewrite_candidate"] = nested["rewrite_candidate"]
+                    if nested.get("append_constraints"):
+                        payload["append_constraints"] = nested["append_constraints"]
+                    if nested.get("reason") and not payload["reason"]:
+                        payload["reason"] = nested["reason"]
+            for key in ("protected_subject_tokens", "protected_style_tokens", "must_keep_phrases", "forbidden_new_subject_tokens"):
+                payload[key] = self._normalize_text_list(payload[key])
+            return payload
+
+        if not isinstance(raw, dict):
+            return payload
+
+        payload["protected_subject_tokens"] = self._normalize_text_list(
+            raw.get("protected_subject_tokens")
+            or raw.get("subject_tokens")
+            or raw.get("subject_keywords")
+            or raw.get("must_keep_subject_tokens")
+        )
+        payload["protected_style_tokens"] = self._normalize_text_list(
+            raw.get("protected_style_tokens")
+            or raw.get("style_tokens")
+            or raw.get("style_keywords")
+            or raw.get("must_keep_style_tokens")
+        )
+        payload["must_keep_phrases"] = self._normalize_text_list(
+            raw.get("must_keep_phrases")
+            or raw.get("keep_phrases")
+            or raw.get("must_keep")
+        )
+        payload["forbidden_new_subject_tokens"] = self._normalize_text_list(
+            raw.get("forbidden_new_subject_tokens")
+            or raw.get("forbidden_tokens")
+            or raw.get("forbidden_new_subjects")
+        )
+
+        for key in (
+            "rewrite_prompt_preserve_subject_style",
+            "rewrite_prompt",
+            "new_prompt",
+            "optimized_prompt",
+            "prompt",
+            "text",
+        ):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                payload["rewrite_candidate"] = value.strip()
+                break
+            if isinstance(value, dict):
+                nested = value.get("text") or value.get("prompt")
+                if isinstance(nested, str) and nested.strip():
+                    payload["rewrite_candidate"] = nested.strip()
+                    break
+
+        for key in ("append_constraints", "constraints", "additional_constraints", "append"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                payload["append_constraints"] = value.strip()
+                break
+
+        for key in ("reason", "rationale", "analysis", "why"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                payload["reason"] = value.strip()
+                break
+
+        if not payload["append_constraints"] and payload["must_keep_phrases"]:
+            payload["append_constraints"] = ", ".join(payload["must_keep_phrases"])
+        return payload
+
+    def _compute_repair_band(self, eval_item: Dict[str, Any]) -> Tuple[str, Optional[float], Optional[float]]:
+        if not isinstance(eval_item, dict):
+            return "unknown", None, None
+        scores = eval_item.get("scores", {})
+        if not isinstance(scores, dict):
+            return "unknown", None, None
+
+        aesthetic = self._safe_float(scores.get("aesthetic"), None)
+        gray = self._safe_float(scores.get("gray_smoothness"), None)
+        alignment = self._safe_float(scores.get("prompt_alignment"), None)
+        noise_raw = self._safe_float(scores.get("noise_artifact"), None)
+        noise_severity = self._normalize_noise_severity(noise_raw)
+
+        if any(v is None for v in (aesthetic, gray, alignment, noise_severity)):
+            return "unknown", None, None
+
+        artifact_cleanliness = 11.0 - noise_severity
+        band_score = min(aesthetic, gray, alignment, artifact_cleanliness)
+        if band_score <= self.task_repair_low_score_max:
+            return "low", band_score, artifact_cleanliness
+        if band_score <= self.task_repair_mid_score_max:
+            return "mid", band_score, artifact_cleanliness
+        return "high", band_score, artifact_cleanliness
+
+    def _prompt_identity_keep_ratio(
+        self,
+        anchor_prompt: str,
+        candidate_prompt: str,
+        protected_subject_tokens: Optional[List[str]] = None,
+        protected_style_tokens: Optional[List[str]] = None,
+        must_keep_phrases: Optional[List[str]] = None,
+    ) -> float:
+        anchor = str(anchor_prompt or "")
+        candidate = str(candidate_prompt or "")
+        anchor_lower = anchor.lower()
+        candidate_lower = candidate.lower()
+
+        keep_terms: List[str] = []
+        keep_terms.extend(self._normalize_text_list(protected_subject_tokens))
+        keep_terms.extend(self._normalize_text_list(protected_style_tokens))
+        keep_terms.extend(self._normalize_text_list(must_keep_phrases))
+        keep_terms = self._normalize_text_list(keep_terms)
+
+        if not keep_terms:
+            anchor_tokens = re.findall(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]+", anchor_lower)
+            fallback_tokens: List[str] = []
+            stop_words = {"the", "a", "an", "and", "with", "for", "from", "this", "that", "of", "to", "in", "on"}
+            for token in anchor_tokens:
+                token = token.strip()
+                if len(token) <= 2:
+                    continue
+                if token in stop_words:
+                    continue
+                fallback_tokens.append(token)
+                if len(fallback_tokens) >= 12:
+                    break
+            keep_terms = self._normalize_text_list(fallback_tokens)
+
+        if not keep_terms:
+            return 1.0
+
+        kept = 0
+        for term in keep_terms:
+            term_lower = term.lower().strip()
+            if term_lower and term_lower in candidate_lower:
+                kept += 1
+        return float(kept) / float(len(keep_terms))
+
+    def _prompt_identity_ok(self, anchor_prompt: str, candidate_prompt: str, payload: Dict[str, Any]) -> Tuple[bool, float]:
+        keep_ratio = self._prompt_identity_keep_ratio(
+            anchor_prompt=anchor_prompt,
+            candidate_prompt=candidate_prompt,
+            protected_subject_tokens=payload.get("protected_subject_tokens"),
+            protected_style_tokens=payload.get("protected_style_tokens"),
+            must_keep_phrases=payload.get("must_keep_phrases"),
+        )
+        if not self.task_prompt_identity_guard:
+            return True, keep_ratio
+
+        if keep_ratio < self.task_prompt_identity_min_keep_ratio:
+            return False, keep_ratio
+
+        anchor_lower = str(anchor_prompt or "").lower()
+        candidate_lower = str(candidate_prompt or "").lower()
+        for token in self._normalize_text_list(payload.get("forbidden_new_subject_tokens")):
+            token_lower = token.lower()
+            if token_lower and token_lower in candidate_lower and token_lower not in anchor_lower:
+                return False, keep_ratio
+
+        return True, keep_ratio
+
+    def _append_constraints_to_prompt(self, base_prompt: str, append_constraints: str) -> str:
+        base = str(base_prompt or "").strip()
+        constraints = str(append_constraints or "").strip()
+        if not constraints:
+            return base
+        if constraints.lower() in base.lower():
+            return base
+        if not base:
+            return constraints
+        if base[-1] in ".!?;。！？；":
+            return f"{base} {constraints}"
+        return f"{base}. {constraints}"
 
     def _dedupe_csv_terms(self, *raw_values: Any) -> str:
         terms: List[str] = []
@@ -1047,7 +1277,8 @@ class AdaptivePPOTrainer:
         scores = eval_item.get("scores", {}) if isinstance(eval_item, dict) else {}
         aesthetic = self._safe_float(scores.get("aesthetic"), 0.0)
         gray = self._safe_float(scores.get("gray_smoothness"), 0.0)
-        noise = self._safe_float(scores.get("noise_artifact"), 0.0)
+        noise_raw = self._safe_float(scores.get("noise_artifact"), 0.0)
+        noise = self._normalize_noise_severity(noise_raw)
         alignment = self._safe_float(scores.get("prompt_alignment"), 0.0)
         labels = set([str(l) for l in (eval_item.get("labels", []) or []) if l is not None])
 
@@ -1095,6 +1326,7 @@ class AdaptivePPOTrainer:
         return dedup
     def _auto_repair(
         self,
+        original_prompt: str,
         current_prompt: str,
         current_negative_prompt: str,
         current_sampling: Dict[str, Any],
@@ -1111,32 +1343,101 @@ class AdaptivePPOTrainer:
         repair_types: List[str] = []
         repair_reason_parts: List[str] = list(fail_reasons or [])
         repair_source = "fallback"
+        payload = self._extract_prompt_optimization_payload(eval_item)
+        repair_band, repair_band_score, artifact_cleanliness = self._compute_repair_band(eval_item)
+        rewrite_candidate = str(payload.get("rewrite_candidate") or "").strip()
+        append_constraints = str(payload.get("append_constraints") or "").strip()
+        protected_subject_tokens = payload.get("protected_subject_tokens", [])
+        protected_style_tokens = payload.get("protected_style_tokens", [])
+        must_keep_phrases = payload.get("must_keep_phrases", [])
+        forbidden_new_subject_tokens = payload.get("forbidden_new_subject_tokens", [])
 
-        prompt_opt = self._coerce_prompt_optimization_text(eval_item)
-        if prompt_opt and prompt_opt != current_prompt:
-            new_prompt = prompt_opt
-            repair_types.append("prompt_rewrite")
-            repair_source = "qwen_prompt_optimization"
-            repair_reason_parts.append("used_prompt_optimization")
-        else:
-            hint_chunks: List[str] = []
-            if "prompt_mismatch" in labels:
-                hint_chunks.append("strict prompt alignment, preserve main subject and composition")
-            if "gray_band" in labels or "dirty_edge" in labels:
-                hint_chunks.append("smooth grayscale gradients, clean edges, smooth shading")
-            if "broken_line" in labels:
-                hint_chunks.append("clean linework, smooth line continuity")
-            if "noise" in labels or "severe_artifact" in labels:
-                hint_chunks.append("artifact-free texture, no noise speckles")
-            if "structure_collapse" in labels or "local_collapse" in labels:
-                hint_chunks.append("stable structure, coherent geometry, avoid collapse")
-            if hint_chunks:
-                hint_text = ", ".join(hint_chunks)
-                if hint_text.lower() not in current_prompt.lower():
-                    new_prompt = f"{current_prompt}. {hint_text}"
+        hint_chunks: List[str] = []
+        if "prompt_mismatch" in labels:
+            hint_chunks.append("strict prompt alignment, preserve main subject and composition")
+        if "gray_band" in labels or "dirty_edge" in labels:
+            hint_chunks.append("smooth grayscale gradients, clean edges, smooth shading")
+        if "broken_line" in labels:
+            hint_chunks.append("clean linework, smooth line continuity")
+        if "noise" in labels or "severe_artifact" in labels:
+            hint_chunks.append("artifact-free texture, no noise speckles")
+        if "structure_collapse" in labels or "local_collapse" in labels:
+            hint_chunks.append("stable structure, coherent geometry, avoid collapse")
+        if "blurry" in critique.lower():
+            hint_chunks.append("sharp details, no blur")
+        rule_constraints = ", ".join(self._normalize_text_list(hint_chunks))
+        if not append_constraints:
+            append_constraints = rule_constraints
+
+        anchor_prompt = original_prompt if self.task_repair_use_original_anchor else current_prompt
+        current_identity_ok, current_keep_ratio = self._prompt_identity_ok(anchor_prompt, current_prompt, payload)
+        identity_guard_passed = current_identity_ok
+        identity_keep_ratio = current_keep_ratio
+        applied_prompt_strategy = "unchanged"
+        prompt_identity_reset = False
+
+        if repair_band == "low":
+            if rewrite_candidate and rewrite_candidate != current_prompt:
+                rewrite_ok, rewrite_keep_ratio = self._prompt_identity_ok(anchor_prompt, rewrite_candidate, payload)
+                identity_guard_passed = rewrite_ok
+                identity_keep_ratio = rewrite_keep_ratio
+                if rewrite_ok:
+                    new_prompt = rewrite_candidate
+                    applied_prompt_strategy = "low_rewrite_candidate"
                     repair_types.append("prompt_rewrite")
-                    repair_reason_parts.append("rule_prompt_rewrite")
+                    repair_reason_parts.append("low_band_rewrite")
+                    repair_source = "qwen_prompt_optimization"
+                else:
+                    base_prompt = anchor_prompt
+                    prompt_identity_reset = base_prompt != current_prompt
+                    new_prompt = self._append_constraints_to_prompt(base_prompt, append_constraints)
+                    applied_prompt_strategy = "low_anchor_append_after_reject"
+                    repair_types.append("prompt_identity_guard_reject")
+                    if append_constraints:
+                        repair_types.append("prompt_constraint_append")
+                    repair_reason_parts.append("identity_guard_reject_rewrite")
+                    if append_constraints:
+                        repair_source = "rule_based"
+            else:
+                base_prompt = anchor_prompt
+                prompt_identity_reset = base_prompt != current_prompt
+                if append_constraints:
+                    new_prompt = self._append_constraints_to_prompt(base_prompt, append_constraints)
+                    applied_prompt_strategy = "low_anchor_append_constraints"
+                    repair_types.append("prompt_constraint_append")
+                    repair_reason_parts.append("low_band_append_constraints")
                     repair_source = "rule_based"
+                else:
+                    new_prompt = base_prompt
+                    applied_prompt_strategy = "low_anchor_reset"
+                    repair_types.append("prompt_anchor_reset")
+                    repair_reason_parts.append("low_band_no_constraints")
+                    repair_source = "rule_based"
+                identity_guard_passed, identity_keep_ratio = self._prompt_identity_ok(anchor_prompt, new_prompt, payload)
+
+        elif repair_band == "mid":
+            base_prompt = current_prompt
+            if not current_identity_ok:
+                base_prompt = anchor_prompt
+                prompt_identity_reset = True
+                repair_types.append("prompt_identity_reset")
+                repair_reason_parts.append("mid_band_identity_drift_reset")
+            if append_constraints:
+                new_prompt = self._append_constraints_to_prompt(base_prompt, append_constraints)
+                applied_prompt_strategy = "mid_append_constraints_only"
+                repair_types.append("prompt_constraint_append")
+                repair_reason_parts.append("mid_band_append_constraints")
+                if repair_source == "fallback":
+                    repair_source = "rule_based"
+            else:
+                new_prompt = base_prompt
+                applied_prompt_strategy = "mid_keep_prompt"
+            identity_guard_passed, identity_keep_ratio = self._prompt_identity_ok(anchor_prompt, new_prompt, payload)
+
+        else:
+            new_prompt = current_prompt
+            applied_prompt_strategy = "high_sampling_negative_only"
+            identity_guard_passed, identity_keep_ratio = self._prompt_identity_ok(anchor_prompt, new_prompt, payload)
 
         if self.task_enable_negative_repair:
             neg_parts: List[str] = []
@@ -1231,6 +1532,19 @@ class AdaptivePPOTrainer:
             "new_negative_prompt": new_negative,
             "old_sampling": current_sampling,
             "new_sampling": new_sampling,
+            "repair_band": repair_band,
+            "repair_band_score": repair_band_score,
+            "artifact_cleanliness": artifact_cleanliness,
+            "identity_guard_passed": bool(identity_guard_passed),
+            "identity_keep_ratio": identity_keep_ratio,
+            "protected_subject_tokens": protected_subject_tokens,
+            "protected_style_tokens": protected_style_tokens,
+            "must_keep_phrases": must_keep_phrases,
+            "append_constraints": append_constraints,
+            "rewrite_candidate": rewrite_candidate,
+            "forbidden_new_subject_tokens": forbidden_new_subject_tokens,
+            "applied_prompt_strategy": applied_prompt_strategy,
+            "prompt_identity_reset": bool(prompt_identity_reset),
         }
         return new_prompt, new_negative, new_sampling, repair_action
 
@@ -1389,10 +1703,11 @@ class AdaptivePPOTrainer:
                 evo = dict(pending_evolution)
                 evo["reward_after"] = qwen_reward
                 prev_reward = evo.get("reward_before")
+                identity_pass = bool(evo.get("identity_guard_passed", False))
                 if qwen_reward is None or prev_reward is None:
                     evo["accepted"] = False
                 else:
-                    evo["accepted"] = bool(float(qwen_reward) > float(prev_reward))
+                    evo["accepted"] = bool(float(qwen_reward) > float(prev_reward) and identity_pass)
                 evo["timestamp"] = datetime.utcnow().isoformat() + "Z"
                 self._append_jsonl_record(self.prompt_evolution_path, evo)
                 pending_evolution = None
@@ -1423,6 +1738,14 @@ class AdaptivePPOTrainer:
             prompt_optimization = eval_item.get("prompt_optimization") if isinstance(eval_item, dict) else None
             judge_status = str(eval_item.get("judge_status") or "runtime_error") if isinstance(eval_item, dict) else "runtime_error"
             judge_valid = self._is_qwen_judge_valid(eval_item)
+            prompt_opt_payload = self._extract_prompt_optimization_payload(eval_item)
+            repair_band, repair_band_score, _ = self._compute_repair_band(eval_item)
+            identity_anchor_prompt = original_prompt if self.task_repair_use_original_anchor else current_prompt
+            identity_guard_passed, identity_keep_ratio = self._prompt_identity_ok(
+                identity_anchor_prompt,
+                current_prompt,
+                prompt_opt_payload,
+            )
 
             final_reward = qwen_reward
             final_scores = scores if isinstance(scores, dict) else {}
@@ -1444,6 +1767,18 @@ class AdaptivePPOTrainer:
                 "repair_type": "none",
                 "repair_reason": "passed" if passed else "not_repaired",
                 "repair_source": "none",
+                "repair_band": repair_band,
+                "repair_band_score": repair_band_score,
+                "identity_guard_passed": bool(identity_guard_passed),
+                "identity_keep_ratio": identity_keep_ratio,
+                "protected_subject_tokens": prompt_opt_payload.get("protected_subject_tokens", []),
+                "protected_style_tokens": prompt_opt_payload.get("protected_style_tokens", []),
+                "must_keep_phrases": prompt_opt_payload.get("must_keep_phrases", []),
+                "append_constraints": prompt_opt_payload.get("append_constraints", ""),
+                "rewrite_candidate": prompt_opt_payload.get("rewrite_candidate", ""),
+                "forbidden_new_subject_tokens": prompt_opt_payload.get("forbidden_new_subject_tokens", []),
+                "applied_prompt_strategy": "none",
+                "prompt_identity_reset": False,
             }
 
             if not passed and attempt_idx < max_retry:
@@ -1459,6 +1794,18 @@ class AdaptivePPOTrainer:
                         "new_negative_prompt": current_negative,
                         "old_sampling": dict(sampling),
                         "new_sampling": dict(sampling),
+                        "repair_band": repair_band,
+                        "repair_band_score": repair_band_score,
+                        "identity_guard_passed": bool(identity_guard_passed),
+                        "identity_keep_ratio": identity_keep_ratio,
+                        "protected_subject_tokens": prompt_opt_payload.get("protected_subject_tokens", []),
+                        "protected_style_tokens": prompt_opt_payload.get("protected_style_tokens", []),
+                        "must_keep_phrases": prompt_opt_payload.get("must_keep_phrases", []),
+                        "append_constraints": prompt_opt_payload.get("append_constraints", ""),
+                        "rewrite_candidate": prompt_opt_payload.get("rewrite_candidate", ""),
+                        "forbidden_new_subject_tokens": prompt_opt_payload.get("forbidden_new_subject_tokens", []),
+                        "applied_prompt_strategy": "judge_invalid_no_prompt_change",
+                        "prompt_identity_reset": False,
                     }
                     used_repair_types.append("judge_invalid_output")
                     logger.warning(
@@ -1470,6 +1817,7 @@ class AdaptivePPOTrainer:
                 elif self.task_enable_auto_repair:
                     prev_prompt = current_prompt
                     current_prompt, current_negative, sampling, repair_action = self._auto_repair(
+                        original_prompt=original_prompt,
                         current_prompt=current_prompt,
                         current_negative_prompt=current_negative,
                         current_sampling=sampling,
@@ -1478,11 +1826,15 @@ class AdaptivePPOTrainer:
                     )
                     used_repair_types.append(str(repair_action.get("repair_type")))
                     logger.info(
-                        "Task prompt_id=%s attempt=%d repair=%s source=%s",
+                        "Task prompt_id=%s attempt=%d repair=%s source=%s band=%s keep_ratio=%.3f guard=%s strategy=%s",
                         task_id,
                         attempt_idx,
                         repair_action.get("repair_type"),
                         repair_action.get("repair_source"),
+                        repair_action.get("repair_band"),
+                        float(repair_action.get("identity_keep_ratio") or 0.0),
+                        bool(repair_action.get("identity_guard_passed")),
+                        repair_action.get("applied_prompt_strategy"),
                     )
 
                     if current_prompt != prev_prompt:
@@ -1498,6 +1850,7 @@ class AdaptivePPOTrainer:
                             "reward_before": qwen_reward,
                             "reward_after": None,
                             "accepted": False,
+                            "identity_guard_passed": bool(repair_action.get("identity_guard_passed", False)),
                         }
                 else:
                     sampling["seed"] = random.randint(1, 2_147_483_647)
@@ -1506,6 +1859,18 @@ class AdaptivePPOTrainer:
                         "repair_reason": "auto_repair_disabled",
                         "repair_source": "fallback",
                         "new_sampling": dict(sampling),
+                        "repair_band": repair_band,
+                        "repair_band_score": repair_band_score,
+                        "identity_guard_passed": bool(identity_guard_passed),
+                        "identity_keep_ratio": identity_keep_ratio,
+                        "protected_subject_tokens": prompt_opt_payload.get("protected_subject_tokens", []),
+                        "protected_style_tokens": prompt_opt_payload.get("protected_style_tokens", []),
+                        "must_keep_phrases": prompt_opt_payload.get("must_keep_phrases", []),
+                        "append_constraints": prompt_opt_payload.get("append_constraints", ""),
+                        "rewrite_candidate": prompt_opt_payload.get("rewrite_candidate", ""),
+                        "forbidden_new_subject_tokens": prompt_opt_payload.get("forbidden_new_subject_tokens", []),
+                        "applied_prompt_strategy": "repair_disabled_seed_only",
+                        "prompt_identity_reset": False,
                     }
                     used_repair_types.append("seed_change")
 
@@ -1540,6 +1905,17 @@ class AdaptivePPOTrainer:
                 "threshold_source": threshold_source,
                 "passed": passed,
                 "fail_reasons": fail_reasons,
+                "repair_band": repair_action.get("repair_band"),
+                "repair_band_score": repair_action.get("repair_band_score"),
+                "identity_guard_passed": repair_action.get("identity_guard_passed"),
+                "identity_keep_ratio": repair_action.get("identity_keep_ratio"),
+                "protected_subject_tokens": repair_action.get("protected_subject_tokens"),
+                "protected_style_tokens": repair_action.get("protected_style_tokens"),
+                "append_constraints": repair_action.get("append_constraints"),
+                "rewrite_candidate": repair_action.get("rewrite_candidate"),
+                "forbidden_new_subject_tokens": repair_action.get("forbidden_new_subject_tokens"),
+                "applied_prompt_strategy": repair_action.get("applied_prompt_strategy"),
+                "prompt_identity_reset": repair_action.get("prompt_identity_reset"),
                 "repair_action": repair_action,
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
@@ -2219,6 +2595,9 @@ class AdaptivePPOTrainer:
             self.adaptive_controller.best_reward = optimizer_state.get('best_reward', float('-inf'))
 
         logger.info(f"Checkpoint loaded from {checkpoint_path}")
+
+
+
 
 
 

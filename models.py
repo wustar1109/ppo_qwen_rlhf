@@ -45,8 +45,18 @@ class PPOConfig:
     qwen_judge_retry_on_invalid: bool = True
     qwen_judge_max_retry: int = 1
     qwen_judge_system_prompt: str = (
-        "You are a strict image quality judge. Return JSON only with fields: "
-        "scores {aesthetic, gray_smoothness, noise_artifact, prompt_alignment} (1-10), critique, prompt_optimization."
+        "You are a senior AIGC image visual designer and prompt engineer. "
+        "Judge generated images with strict technical and aesthetic standards. "
+        "Scoring semantics: noise_artifact means artifact severity where 1 is clean/artifact-free and 10 is severe artifacts/noise; higher is worse. "
+        "You must diagnose defects and provide repair advice while preserving subject identity and style identity. "
+        "Do NOT introduce new subjects, scenes, color themes, camera angles, or art styles. "
+        "Return JSON only with fields: "
+        "scores {aesthetic, gray_smoothness, noise_artifact, prompt_alignment} (1-10), "
+        "confidence (0-1), labels (list), critique, prompt_optimization {"
+        "protected_subject_tokens, protected_style_tokens, must_keep_phrases, "
+        "rewrite_prompt_preserve_subject_style, append_constraints, forbidden_new_subject_tokens, reason"
+        "}. "
+        "Use labels from: noise, dirty_edge, broken_line, gray_band, local_collapse, prompt_mismatch, structure_collapse, severe_artifact."
     )
     qwen_judge_max_new_tokens: int = 512
     qwen_judge_temperature: float = 0.2
@@ -67,11 +77,12 @@ class PPOConfig:
     qwen_fatal_labels: str = "structure_collapse,prompt_mismatch,severe_artifact"
     qwen_pairwise_samples: int = 1
     qwen_pairwise_every: int = 50
+    qwen_noise_higher_is_worse: bool = True
     human_review_every: int = 0
     human_disagreement_threshold: float = 2.0
 
     schema_version: str = "v1"
-    qwen_judge_prompt_version: str = "v1"
+    qwen_judge_prompt_version: str = "v2_designer_guarded"
     run_id: Optional[str] = None
 
     # Logging / outputs
@@ -131,6 +142,11 @@ class PPOConfig:
     task_output_dir: Optional[str] = None
     task_export_learning_data: bool = False
     task_disable_training: bool = True
+    task_repair_low_score_max: float = 3.0
+    task_repair_mid_score_max: float = 6.0
+    task_prompt_identity_guard: bool = True
+    task_prompt_identity_min_keep_ratio: float = 0.6
+    task_repair_use_original_anchor: bool = True
 
     output_dir: str = "./ppo_qwen_output"
     checkpoint_dir: str = "./checkpoints"
@@ -313,9 +329,3 @@ class PPOMemory:
 
     def __len__(self):
         return len(self.states)
-
-
-
-
-
-

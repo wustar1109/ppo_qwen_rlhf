@@ -25,11 +25,18 @@ def parse_tristate_bool(value):
 
 
 DEFAULT_QWEN_SYSTEM_PROMPT = (
-    "You are a strict image quality judge. Return JSON only with fields: "
+    "You are a senior AIGC image visual designer and prompt engineer. "
+    "Judge generated images with strict technical and aesthetic standards. "
+    "Scoring semantics: noise_artifact means artifact severity where 1 is clean/artifact-free and 10 is severe artifacts/noise; higher is worse. "
+    "You must diagnose defects and provide repair advice while preserving subject identity and style identity. "
+    "Do NOT introduce new subjects, scenes, color themes, camera angles, or art styles. "
+    "Return JSON only with fields: "
     "scores {aesthetic, gray_smoothness, noise_artifact, prompt_alignment} (1-10), "
-    "confidence (0-1), labels (list), critique, prompt_optimization. "
-    "Use labels from: noise, dirty_edge, broken_line, gray_band, local_collapse, "
-    "prompt_mismatch, structure_collapse, severe_artifact."
+    "confidence (0-1), labels (list), critique, prompt_optimization {"
+    "protected_subject_tokens, protected_style_tokens, must_keep_phrases, "
+    "rewrite_prompt_preserve_subject_style, append_constraints, forbidden_new_subject_tokens, reason"
+    "}. "
+    "Use labels from: noise, dirty_edge, broken_line, gray_band, local_collapse, prompt_mismatch, structure_collapse, severe_artifact."
 )
 
 
@@ -70,7 +77,7 @@ def parse_args():
     parser.add_argument("--qwen_judge_retry_on_invalid", type=str2bool, default=True)
     parser.add_argument("--qwen_judge_max_retry", type=int, default=1)
     parser.add_argument("--qwen_judge_system_prompt", type=str, default=DEFAULT_QWEN_SYSTEM_PROMPT)
-    parser.add_argument("--qwen_judge_prompt_version", type=str, default="v1")
+    parser.add_argument("--qwen_judge_prompt_version", type=str, default="v2_designer_guarded")
     parser.add_argument("--qwen_judge_max_new_tokens", type=int, default=512)
     parser.add_argument("--qwen_judge_temperature", type=float, default=0.2)
     parser.add_argument("--qwen_judge_top_p", type=float, default=0.9)
@@ -90,6 +97,7 @@ def parse_args():
     parser.add_argument("--qwen_fatal_labels", type=str, default="structure_collapse,prompt_mismatch,severe_artifact")
     parser.add_argument("--qwen_pairwise_samples", type=int, default=1)
     parser.add_argument("--qwen_pairwise_every", type=int, default=50)
+    parser.add_argument("--qwen_noise_higher_is_worse", type=str2bool, default=True)
 
     # Logging / outputs
     parser.add_argument("--enable_wandb", type=str2bool, default=False)
@@ -146,6 +154,11 @@ def parse_args():
     parser.add_argument("--task_output_dir", type=str, default=None)
     parser.add_argument("--task_export_learning_data", type=str2bool, default=False)
     parser.add_argument("--task_disable_training", type=str2bool, default=True)
+    parser.add_argument("--task_repair_low_score_max", type=float, default=3.0)
+    parser.add_argument("--task_repair_mid_score_max", type=float, default=6.0)
+    parser.add_argument("--task_prompt_identity_guard", type=str2bool, default=True)
+    parser.add_argument("--task_prompt_identity_min_keep_ratio", type=float, default=0.6)
+    parser.add_argument("--task_repair_use_original_anchor", type=str2bool, default=True)
 
     # Output config
     parser.add_argument("--output_dir", type=str, default="./ppo_qwen_output")
@@ -220,6 +233,7 @@ def get_config_from_args(args):
         qwen_fatal_labels=args.qwen_fatal_labels,
         qwen_pairwise_samples=args.qwen_pairwise_samples,
         qwen_pairwise_every=args.qwen_pairwise_every,
+        qwen_noise_higher_is_worse=args.qwen_noise_higher_is_worse,
 
         enable_wandb=args.enable_wandb,
         wandb_project=args.wandb_project,
@@ -271,6 +285,11 @@ def get_config_from_args(args):
         task_output_dir=args.task_output_dir,
         task_export_learning_data=args.task_export_learning_data,
         task_disable_training=args.task_disable_training,
+        task_repair_low_score_max=args.task_repair_low_score_max,
+        task_repair_mid_score_max=args.task_repair_mid_score_max,
+        task_prompt_identity_guard=args.task_prompt_identity_guard,
+        task_prompt_identity_min_keep_ratio=args.task_prompt_identity_min_keep_ratio,
+        task_repair_use_original_anchor=args.task_repair_use_original_anchor,
 
         output_dir=args.output_dir,
         checkpoint_dir=args.checkpoint_dir,
@@ -287,8 +306,3 @@ def get_config_from_args(args):
         lora_dropout=args.lora_dropout,
     )
     return config
-
-
-
-
-

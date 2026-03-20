@@ -28,10 +28,175 @@ def _coerce_labels(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, list):
-        return [str(v) for v in value if v is not None]
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
     if isinstance(value, str):
         return [v.strip() for v in value.split(",") if v.strip()]
     return []
+
+
+def _dedupe_list(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def _ensure_text_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return _dedupe_list([str(v).strip() for v in value if v is not None])
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if "," in text:
+            return _dedupe_list([part.strip() for part in text.split(",") if part.strip()])
+        return [text]
+    if isinstance(value, dict):
+        out: List[str] = []
+        for k in ("tokens", "items", "values", "list", "subject", "style"):
+            if k in value:
+                out.extend(_ensure_text_list(value.get(k)))
+        return _dedupe_list(out)
+    return []
+
+
+def _first_text(value: Any, keys: List[str]) -> Optional[str]:
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        v = value.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, dict):
+            nested = _first_text(v, ["text", "prompt", "value"])
+            if nested:
+                return nested
+    return None
+
+
+def _normalize_prompt_optimization(value: Any) -> Dict[str, Any]:
+    normalized = {
+        "protected_subject_tokens": [],
+        "protected_style_tokens": [],
+        "must_keep_phrases": [],
+        "rewrite_prompt_preserve_subject_style": "",
+        "append_constraints": "",
+        "forbidden_new_subject_tokens": [],
+        "reason": "",
+    }
+
+    if value is None:
+        return normalized
+
+    if isinstance(value, str):
+        normalized["rewrite_prompt_preserve_subject_style"] = value.strip()
+        return normalized
+
+    if isinstance(value, list):
+        rewrite_candidate = ""
+        append_parts: List[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                item_norm = _normalize_prompt_optimization(item)
+                if not rewrite_candidate and item_norm["rewrite_prompt_preserve_subject_style"]:
+                    rewrite_candidate = item_norm["rewrite_prompt_preserve_subject_style"]
+                if item_norm["append_constraints"]:
+                    append_parts.append(item_norm["append_constraints"])
+                normalized["protected_subject_tokens"].extend(item_norm["protected_subject_tokens"])
+                normalized["protected_style_tokens"].extend(item_norm["protected_style_tokens"])
+                normalized["must_keep_phrases"].extend(item_norm["must_keep_phrases"])
+                normalized["forbidden_new_subject_tokens"].extend(item_norm["forbidden_new_subject_tokens"])
+                if item_norm["reason"] and not normalized["reason"]:
+                    normalized["reason"] = item_norm["reason"]
+            elif isinstance(item, str) and item.strip():
+                if not rewrite_candidate:
+                    rewrite_candidate = item.strip()
+                else:
+                    append_parts.append(item.strip())
+
+        normalized["rewrite_prompt_preserve_subject_style"] = rewrite_candidate
+        normalized["append_constraints"] = "; ".join([p for p in append_parts if p]).strip()
+        normalized["protected_subject_tokens"] = _dedupe_list(normalized["protected_subject_tokens"])
+        normalized["protected_style_tokens"] = _dedupe_list(normalized["protected_style_tokens"])
+        normalized["must_keep_phrases"] = _dedupe_list(normalized["must_keep_phrases"])
+        normalized["forbidden_new_subject_tokens"] = _dedupe_list(normalized["forbidden_new_subject_tokens"])
+        return normalized
+
+    if not isinstance(value, dict):
+        return normalized
+
+    source = dict(value)
+    if "prompt_optimization" in source and isinstance(source.get("prompt_optimization"), (dict, list, str)):
+        nested = _normalize_prompt_optimization(source.get("prompt_optimization"))
+        for k in normalized.keys():
+            if isinstance(nested.get(k), list):
+                normalized[k].extend(nested[k])
+            elif isinstance(nested.get(k), str) and nested[k]:
+                normalized[k] = nested[k]
+
+    normalized["protected_subject_tokens"].extend(_ensure_text_list(
+        source.get("protected_subject_tokens")
+        or source.get("subject_tokens")
+        or source.get("subject_keywords")
+        or source.get("must_keep_subject_tokens")
+    ))
+    normalized["protected_style_tokens"].extend(_ensure_text_list(
+        source.get("protected_style_tokens")
+        or source.get("style_tokens")
+        or source.get("style_keywords")
+        or source.get("must_keep_style_tokens")
+    ))
+    normalized["must_keep_phrases"].extend(_ensure_text_list(
+        source.get("must_keep_phrases")
+        or source.get("keep_phrases")
+        or source.get("must_keep")
+        or source.get("protected_phrases")
+    ))
+    normalized["forbidden_new_subject_tokens"].extend(_ensure_text_list(
+        source.get("forbidden_new_subject_tokens")
+        or source.get("forbidden_tokens")
+        or source.get("forbidden_new_subjects")
+    ))
+
+    rewrite = _first_text(source, [
+        "rewrite_prompt_preserve_subject_style",
+        "rewrite_prompt",
+        "new_prompt",
+        "optimized_prompt",
+        "prompt",
+        "text",
+    ])
+    append_constraints = _first_text(source, [
+        "append_constraints",
+        "constraints",
+        "additional_constraints",
+        "append",
+    ])
+    reason = _first_text(source, ["reason", "rationale", "analysis", "why"])
+
+    if rewrite:
+        normalized["rewrite_prompt_preserve_subject_style"] = rewrite
+    if append_constraints:
+        normalized["append_constraints"] = append_constraints
+    if reason:
+        normalized["reason"] = reason
+
+    normalized["protected_subject_tokens"] = _dedupe_list(normalized["protected_subject_tokens"])
+    normalized["protected_style_tokens"] = _dedupe_list(normalized["protected_style_tokens"])
+    normalized["must_keep_phrases"] = _dedupe_list(normalized["must_keep_phrases"])
+    normalized["forbidden_new_subject_tokens"] = _dedupe_list(normalized["forbidden_new_subject_tokens"])
+
+    return normalized
 
 
 def _extract_json_block(raw_text: str) -> Optional[str]:
@@ -120,7 +285,7 @@ def _validate_schema(parsed: Optional[Dict[str, Any]], strict_schema: bool = Fal
         "confidence": None,
         "labels": [],
         "critique": None,
-        "prompt_optimization": None,
+        "prompt_optimization": _normalize_prompt_optimization(None),
     }
 
     if not isinstance(parsed, dict):
@@ -129,6 +294,11 @@ def _validate_schema(parsed: Optional[Dict[str, Any]], strict_schema: bool = Fal
     scores = parsed.get("scores")
     if not isinstance(scores, dict):
         return False, "scores_missing_or_not_dict", normalized
+
+    # Alias compatibility: artifact_severity -> noise_artifact
+    if scores.get("noise_artifact") is None and scores.get("artifact_severity") is not None:
+        scores = dict(scores)
+        scores["noise_artifact"] = scores.get("artifact_severity")
 
     core_fields = ["aesthetic", "gray_smoothness", "noise_artifact", "prompt_alignment"]
     missing_or_invalid = []
@@ -145,7 +315,7 @@ def _validate_schema(parsed: Optional[Dict[str, Any]], strict_schema: bool = Fal
 
     normalized["labels"] = _coerce_labels(parsed.get("labels"))
     normalized["critique"] = parsed.get("critique") if parsed.get("critique") is not None else None
-    normalized["prompt_optimization"] = parsed.get("prompt_optimization") if parsed.get("prompt_optimization") is not None else None
+    normalized["prompt_optimization"] = _normalize_prompt_optimization(parsed.get("prompt_optimization"))
 
     if missing_or_invalid:
         return False, "missing_or_invalid_fields:" + ",".join(missing_or_invalid), normalized
@@ -154,7 +324,7 @@ def _validate_schema(parsed: Optional[Dict[str, Any]], strict_schema: bool = Fal
         score_range_invalid = []
         for field in core_fields:
             val = normalized["scores"][field]
-            if val is None or val < 0 or val > 10:
+            if val is None or val < 1 or val > 10:
                 score_range_invalid.append(field)
         if score_range_invalid:
             return False, "score_out_of_range:" + ",".join(score_range_invalid), normalized
@@ -242,14 +412,12 @@ class QwenVLJudge:
         model_classes = []
         try:
             from transformers import AutoModelForImageTextToText
-
             model_classes.append(AutoModelForImageTextToText)
         except Exception:
             pass
 
         try:
             from transformers import AutoModelForVision2Seq
-
             model_classes.append(AutoModelForVision2Seq)
         except Exception:
             pass
@@ -277,8 +445,14 @@ class QwenVLJudge:
         user_prompt = (
             "Prompt used to generate the image:\n"
             f"{prompt_text}\n\n"
-            "Return JSON only with fields: scores {aesthetic, gray_smoothness, noise_artifact, prompt_alignment} (1-10), "
-            "confidence (0-1), labels (list), critique, prompt_optimization."
+            "Evaluate this image as a senior AIGC visual designer and prompt engineer. "
+            "Important scoring semantics: noise_artifact means artifact severity where 1 is clean/artifact-free and 10 is severe artifacts/noise (higher is worse). "
+            "Provide strict diagnostics and prompt repair suggestions while preserving subject/style identity. "
+            "Do NOT introduce new subjects, scenes, color themes, camera angles, or art styles.\n\n"
+            "Return JSON only with fields:\n"
+            "scores {aesthetic, gray_smoothness, noise_artifact, prompt_alignment} (1-10),\n"
+            "confidence (0-1), labels (list), critique,\n"
+            "prompt_optimization {protected_subject_tokens, protected_style_tokens, must_keep_phrases, rewrite_prompt_preserve_subject_style, append_constraints, forbidden_new_subject_tokens, reason}."
         )
         if hasattr(self.processor, "apply_chat_template"):
             messages = [
@@ -353,7 +527,7 @@ class QwenVLJudge:
             "confidence": None,
             "labels": [],
             "critique": None,
-            "prompt_optimization": None,
+            "prompt_optimization": _normalize_prompt_optimization(None),
             "parse_success": False,
             "parse_error": None,
             "schema_valid": False,
@@ -406,7 +580,7 @@ class QwenVLJudge:
                     "confidence": None,
                     "labels": [],
                     "critique": None,
-                    "prompt_optimization": None,
+                    "prompt_optimization": _normalize_prompt_optimization(None),
                     "parse_success": False,
                     "parse_error": parse_error,
                     "schema_valid": False,

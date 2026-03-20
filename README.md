@@ -79,3 +79,27 @@ for epoch in range(config.num_epochs):
 - `data/train.json` - 训练数据
 - `checkpoints/` - 模型检查点
 - `logs/` - 训练日志
+
+## Task Mode (A-Route Closed-Loop Execution)
+
+When `--task_excel_path` (or CSV task file) is provided, the system runs **task mode** as an
+execution loop:
+
+1. read prompt tasks from table rows
+2. generate image
+3. evaluate with Qwen judge
+4. repair prompt/negative/sampling if needed
+5. retry until pass or max retry
+
+This is an **A-route closed-loop execution path** (experience collection), not the synchronous
+PPO train loop. PPO training remains available in normal train mode.
+
+### Designer-Guarded Judge + Banded Repair
+
+- Qwen judge role: `senior AIGC image visual designer and prompt engineer`
+- `noise_artifact` semantics are explicit: `1=clean`, `10=severe`, `higher=worse`
+- Banded repair policy:
+  - low band: rewrite allowed only if identity guard passes
+  - mid band: append constraints only, no full rewrite
+  - high band: keep prompt text, repair sampling/negative only
+- Identity guard prevents subject/style drift and can reset to original anchor prompt.
