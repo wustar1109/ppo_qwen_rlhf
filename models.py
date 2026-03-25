@@ -147,6 +147,11 @@ class PPOConfig:
     task_prompt_identity_guard: bool = True
     task_prompt_identity_min_keep_ratio: float = 0.6
     task_repair_use_original_anchor: bool = True
+    task_online_rlhf: bool = False
+    task_online_update_every: int = 1
+    task_online_min_confidence: float = 0.0
+    task_online_force_grad_generation: bool = True
+    task_online_final_save_path: Optional[str] = None
 
     output_dir: str = "./ppo_qwen_output"
     checkpoint_dir: str = "./checkpoints"

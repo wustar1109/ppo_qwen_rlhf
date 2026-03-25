@@ -159,6 +159,11 @@ def parse_args():
     parser.add_argument("--task_prompt_identity_guard", type=str2bool, default=True)
     parser.add_argument("--task_prompt_identity_min_keep_ratio", type=float, default=0.6)
     parser.add_argument("--task_repair_use_original_anchor", type=str2bool, default=True)
+    parser.add_argument("--task_online_rlhf", type=str2bool, default=False)
+    parser.add_argument("--task_online_update_every", type=int, default=1)
+    parser.add_argument("--task_online_min_confidence", type=float, default=0.0)
+    parser.add_argument("--task_online_force_grad_generation", type=str2bool, default=True)
+    parser.add_argument("--task_online_final_save_path", type=str, default=None)
 
     # Output config
     parser.add_argument("--output_dir", type=str, default="./ppo_qwen_output")
@@ -290,6 +295,11 @@ def get_config_from_args(args):
         task_prompt_identity_guard=args.task_prompt_identity_guard,
         task_prompt_identity_min_keep_ratio=args.task_prompt_identity_min_keep_ratio,
         task_repair_use_original_anchor=args.task_repair_use_original_anchor,
+        task_online_rlhf=args.task_online_rlhf,
+        task_online_update_every=args.task_online_update_every,
+        task_online_min_confidence=args.task_online_min_confidence,
+        task_online_force_grad_generation=args.task_online_force_grad_generation,
+        task_online_final_save_path=args.task_online_final_save_path,
 
         output_dir=args.output_dir,
         checkpoint_dir=args.checkpoint_dir,

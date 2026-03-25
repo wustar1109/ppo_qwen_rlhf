@@ -1,10 +1,10 @@
 ﻿"""
-Task execution runner for the async-decoupled online loop.
+Task execution runner for task loops.
 
 A-route responsibilities:
 - execute prompt tasks (generate -> judge -> repair -> retry)
 - record trajectories
-- avoid synchronous PPO optimizer updates
+- optionally perform in-memory online updates (task_online_rlhf)
 """
 
 from __future__ import annotations
@@ -19,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 
 class TaskExecutionRunner:
-    """Runs task queue execution in inference/no-grad mode."""
+    """Runs task queue execution in inference mode or online-update mode."""
 
     def __init__(self, trainer, config):
         self.trainer = trainer
         self.config = config
+        self.task_online_rlhf = bool(getattr(config, "task_online_rlhf", False))
+        self.task_online_force_grad_generation = bool(getattr(config, "task_online_force_grad_generation", True))
 
     @contextmanager
     def _inference_mode(self):
@@ -66,10 +68,18 @@ class TaskExecutionRunner:
             }
 
         logger.info("Task execution mode started. total_tasks=%d", len(tasks))
-        logger.info("A-route online loop is active; PPO train loop is disabled for this run.")
-
-        with self._inference_mode():
+        if self.task_online_rlhf:
+            logger.info("Task mode with online RLHF is active: in-memory updates enabled, no mid-run checkpoints.")
+            backend = getattr(getattr(self.trainer, "z_image", None), "backend", None)
+            if self.task_online_force_grad_generation and backend is not None and hasattr(backend, "enable_grad"):
+                if not bool(getattr(backend, "enable_grad")):
+                    logger.info("Forcing z-image backend enable_grad=True for task_online_rlhf mode.")
+                backend.enable_grad = True
             result = self.trainer.run_prompt_task_queue(tasks)
+        else:
+            logger.info("A-route online loop is active; PPO train loop is disabled for this run.")
+            with self._inference_mode():
+                result = self.trainer.run_prompt_task_queue(tasks)
 
         logger.info(
             "Task execution mode finished. total=%s passed=%s failed=%s",

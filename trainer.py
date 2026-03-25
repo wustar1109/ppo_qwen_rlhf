@@ -212,6 +212,14 @@ class AdaptivePPOTrainer:
         self.task_prompt_identity_guard = bool(getattr(config, "task_prompt_identity_guard", True))
         self.task_prompt_identity_min_keep_ratio = float(getattr(config, "task_prompt_identity_min_keep_ratio", 0.6))
         self.task_repair_use_original_anchor = bool(getattr(config, "task_repair_use_original_anchor", True))
+        self.task_online_rlhf = bool(getattr(config, "task_online_rlhf", False))
+        self.task_online_update_every = max(1, int(getattr(config, "task_online_update_every", 1) or 1))
+        self.task_online_min_confidence = float(getattr(config, "task_online_min_confidence", 0.0))
+        self.task_online_force_grad_generation = bool(getattr(config, "task_online_force_grad_generation", True))
+        self.task_online_final_save_path = getattr(config, "task_online_final_save_path", None)
+        self._task_online_update_count = 0
+        self._task_online_buffer: List[Dict[str, Any]] = []
+        self._task_online_last_metrics: Dict[str, Any] = {}
 
         self.task_run_records_path = os.path.join(self.eval_output_dir, "task_run_records.jsonl")
         self.task_summary_path = os.path.join(self.eval_output_dir, "task_summary.jsonl")
@@ -832,6 +840,125 @@ class AdaptivePPOTrainer:
         if self.qwen_noise_higher_is_worse:
             return score
         return max(1.0, 11.0 - score)
+
+    def _task_online_update_enabled(self) -> bool:
+        return bool(self.task_online_rlhf and self.actor_type == "z-image")
+
+    def _task_online_collect_sample(
+        self,
+        prompt_text: str,
+        image: Optional[Image.Image],
+        log_prob_value: Optional[torch.Tensor],
+        qwen_reward: Optional[float],
+        confidence: Optional[float],
+        judge_valid: bool,
+    ) -> Dict[str, Any]:
+        if not self._task_online_update_enabled():
+            return {"online_update_enabled": False, "online_update_applied": False, "online_update_skipped_reason": "disabled"}
+        if image is None:
+            return {"online_update_enabled": True, "online_update_applied": False, "online_update_skipped_reason": "missing_image"}
+        if not judge_valid or qwen_reward is None:
+            return {"online_update_enabled": True, "online_update_applied": False, "online_update_skipped_reason": "invalid_judge_or_reward"}
+
+        conf = self._safe_float(confidence, 0.0)
+        if conf < self.task_online_min_confidence:
+            return {
+                "online_update_enabled": True,
+                "online_update_applied": False,
+                "online_update_skipped_reason": "low_confidence",
+                "online_update_confidence": conf,
+            }
+
+        reward_value = float(qwen_reward)
+        advantage_value = reward_value - self.reward_baseline
+        self.reward_baseline = (
+            (1 - self.reward_baseline_alpha) * self.reward_baseline
+            + self.reward_baseline_alpha * reward_value
+        )
+
+        self._task_online_buffer.append(
+            {
+                "prompt": str(prompt_text or ""),
+                "image": image,
+                "log_prob": log_prob_value,
+                "advantage": advantage_value,
+                "reward": reward_value,
+                "confidence": conf,
+            }
+        )
+
+        if len(self._task_online_buffer) < self.task_online_update_every:
+            return {
+                "online_update_enabled": True,
+                "online_update_applied": False,
+                "online_update_skipped_reason": "buffering",
+                "online_update_buffer_size": len(self._task_online_buffer),
+                "online_update_target_batch": self.task_online_update_every,
+                "online_advantage": advantage_value,
+            }
+
+        return self._task_online_flush_updates(trigger="interval")
+
+    def _task_online_flush_updates(self, trigger: str = "manual") -> Dict[str, Any]:
+        if not self._task_online_update_enabled():
+            return {"online_update_enabled": False, "online_update_applied": False, "online_update_skipped_reason": "disabled"}
+        if not self._task_online_buffer:
+            return {"online_update_enabled": True, "online_update_applied": False, "online_update_skipped_reason": "empty_buffer"}
+
+        batch = list(self._task_online_buffer)
+        self._task_online_buffer = []
+
+        prompts = [item["prompt"] for item in batch]
+        images = [item["image"] for item in batch]
+        advantages = torch.tensor(
+            [float(item["advantage"]) for item in batch],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        log_prob_values = []
+        all_have_log_prob = True
+        for item in batch:
+            lp = item.get("log_prob")
+            if lp is None:
+                all_have_log_prob = False
+                break
+            if not isinstance(lp, torch.Tensor):
+                lp = torch.tensor(lp, device=self.device, dtype=torch.float32)
+            else:
+                lp = lp.to(self.device).float()
+            if lp.numel() == 1:
+                log_prob_values.append(lp.reshape(-1)[0])
+            else:
+                log_prob_values.append(lp.mean())
+        log_probs = torch.stack(log_prob_values) if all_have_log_prob and log_prob_values else None
+
+        policy_metrics = self.z_image.policy_gradient_step(
+            prompts=prompts,
+            images=images,
+            log_probs=log_probs,
+            advantages=advantages,
+        )
+
+        self._task_online_update_count += 1
+        metrics = {
+            "online_update_enabled": True,
+            "online_update_applied": True,
+            "online_update_trigger": trigger,
+            "online_update_batch_size": len(batch),
+            "online_update_count": self._task_online_update_count,
+            "online_update_skipped_reason": None,
+            "online_mean_reward": float(sum([float(item["reward"]) for item in batch]) / max(len(batch), 1)),
+            "online_mean_advantage": float(sum([float(item["advantage"]) for item in batch]) / max(len(batch), 1)),
+        }
+        if isinstance(policy_metrics, dict):
+            metrics.update(policy_metrics)
+            if policy_metrics.get("policy_update_skipped"):
+                metrics["online_update_applied"] = False
+                metrics["online_update_skipped_reason"] = "backend_policy_update_skipped"
+
+        self._task_online_last_metrics = dict(metrics)
+        return metrics
 
     def _task_sampling_defaults(self) -> Dict[str, Any]:
         defaults: Dict[str, Any] = {}
@@ -1626,6 +1753,7 @@ class AdaptivePPOTrainer:
             )
 
             generated_image = None
+            attempt_log_probs = None
             image_path = None
             extra: Dict[str, Any] = {}
             eval_item: Dict[str, Any] = {
@@ -1655,13 +1783,18 @@ class AdaptivePPOTrainer:
             judge_error: Optional[str] = None
 
             try:
-                generated_images, _, extra = self.generate_images(
+                generated_images, attempt_log_probs, extra = self.generate_images(
                     prompts=[{"text": current_prompt}],
                     images=None,
                     generation_kwargs=generation_kwargs,
                 )
                 if generated_images:
                     generated_image = generated_images[0]
+                if isinstance(attempt_log_probs, torch.Tensor):
+                    if attempt_log_probs.numel() > 0:
+                        attempt_log_probs = attempt_log_probs.view(-1)[0]
+                    else:
+                        attempt_log_probs = None
                 if generated_image is None:
                     raise RuntimeError("z-image returned no image")
                 image_path = self._save_image(generated_image, f"task_{task_id}", attempt_idx)
@@ -1749,6 +1882,29 @@ class AdaptivePPOTrainer:
 
             final_reward = qwen_reward
             final_scores = scores if isinstance(scores, dict) else {}
+            online_update_metrics = {
+                "online_update_enabled": bool(self._task_online_update_enabled()),
+                "online_update_applied": False,
+                "online_update_skipped_reason": "not_attempted",
+            }
+            if self._task_online_update_enabled():
+                online_update_metrics = self._task_online_collect_sample(
+                    prompt_text=current_prompt,
+                    image=generated_image,
+                    log_prob_value=attempt_log_probs,
+                    qwen_reward=qwen_reward,
+                    confidence=confidence,
+                    judge_valid=judge_valid,
+                )
+                if online_update_metrics.get("online_update_applied"):
+                    logger.info(
+                        "Task online update applied. task_id=%s attempt=%d batch=%s policy_loss=%s skipped=%s",
+                        task_id,
+                        attempt_idx,
+                        online_update_metrics.get("online_update_batch_size"),
+                        online_update_metrics.get("policy_loss"),
+                        online_update_metrics.get("policy_update_skipped", False),
+                    )
 
             sampling_used = dict(generation_kwargs)
             if isinstance(extra, dict):
@@ -1917,6 +2073,11 @@ class AdaptivePPOTrainer:
                 "applied_prompt_strategy": repair_action.get("applied_prompt_strategy"),
                 "prompt_identity_reset": repair_action.get("prompt_identity_reset"),
                 "repair_action": repair_action,
+                "online_update": online_update_metrics,
+                "online_update_applied": online_update_metrics.get("online_update_applied"),
+                "online_update_skipped_reason": online_update_metrics.get("online_update_skipped_reason"),
+                "online_update_batch_size": online_update_metrics.get("online_update_batch_size"),
+                "online_policy_loss": online_update_metrics.get("policy_loss"),
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
             self._append_jsonl_record(self.task_run_records_path, record)
@@ -2058,6 +2219,16 @@ class AdaptivePPOTrainer:
                 summary.get("final_status"),
             )
 
+        online_flush_metrics = None
+        if self._task_online_update_enabled():
+            online_flush_metrics = self._task_online_flush_updates(trigger="queue_end")
+            logger.info(
+                "Task online RLHF finalize: applied=%s updates=%s reason=%s",
+                online_flush_metrics.get("online_update_applied"),
+                online_flush_metrics.get("online_update_count", self._task_online_update_count),
+                online_flush_metrics.get("online_update_skipped_reason"),
+            )
+
         result = {
             "schema_version": self.schema_version,
             "run_id": self.run_id,
@@ -2067,6 +2238,10 @@ class AdaptivePPOTrainer:
             "task_results": task_results,
             "start_time": start_time,
             "end_time": datetime.utcnow().isoformat() + "Z",
+            "task_online_rlhf": bool(self._task_online_update_enabled()),
+            "online_update_count": self._task_online_update_count,
+            "online_update_last_metrics": self._task_online_last_metrics,
+            "online_flush_metrics": online_flush_metrics,
         }
         logger.info(
             "Task queue completed. total=%d passed=%d failed=%d",

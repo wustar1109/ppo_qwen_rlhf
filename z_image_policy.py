@@ -258,6 +258,7 @@ class _DiffusersZImageBackend:
         self.scheduler = getattr(self.pipe, "scheduler", None)
         self.default_kwargs = self._build_default_kwargs()
         self.optimizer, self.trainable_params = self._init_optimizer()
+        self._last_image_tensors: Optional[torch.Tensor] = None
 
     def _infer_turbo(self) -> bool:
         name = os.path.basename(self.model_path).lower()
@@ -637,6 +638,7 @@ class _DiffusersZImageBackend:
             "negative_prompt": kwargs.get("negative_prompt"),
         }
 
+        self._last_image_tensors = None
         return images, None, extra
 
     def _generate_with_grad(
@@ -845,6 +847,7 @@ class _DiffusersZImageBackend:
             "seed": seed,
             "negative_prompt": negative_prompt,
         }
+        self._last_image_tensors = image_tensors
 
         return images, None, extra
     def generate(
@@ -907,7 +910,22 @@ class _DiffusersZImageBackend:
         elif advantages is not None:
             if not isinstance(advantages, torch.Tensor):
                 advantages = torch.tensor(advantages)
-            loss = -advantages.mean()
+            # Fallback path for diffusers backend:
+            # if we have a differentiable image tensor from the most recent grad generation,
+            # build a lightweight surrogate objective to keep online updates in-memory.
+            image_tensors = self._last_image_tensors
+            if isinstance(image_tensors, torch.Tensor) and image_tensors.requires_grad:
+                adv = advantages.to(image_tensors.device).float()
+                if image_tensors.dim() == 3:
+                    image_tensors = image_tensors.unsqueeze(0)
+                per_sample = image_tensors.float().mean(dim=(1, 2, 3))
+                if adv.numel() == 1 and per_sample.numel() > 1:
+                    adv = adv.repeat(per_sample.numel())
+                if adv.numel() != per_sample.numel():
+                    adv = adv.reshape(-1)[: per_sample.numel()]
+                loss = -(per_sample * adv.detach()).mean()
+            else:
+                loss = -advantages.mean()
 
         if loss is None:
             return {"policy_update_skipped": True, "backend": "diffusers"}

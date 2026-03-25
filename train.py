@@ -48,7 +48,10 @@ def _run_task_execution_mode(args, config) -> Dict[str, Any]:
         config.eval_output_dir = config.task_output_dir
 
     config.task_mode_only = True
-    logger.info("Task mode selected. Using async-decoupled A-route execution loop.")
+    if getattr(config, "task_online_rlhf", False):
+        logger.info("Task mode selected: task_online_rlhf (Excel loop + in-memory online updates).")
+    else:
+        logger.info("Task mode selected. Using async-decoupled A-route execution loop.")
     if not getattr(config, "task_disable_training", True):
         logger.warning(
             "task_disable_training=false is ignored in task mode; synchronous PPO training remains disabled by design."
@@ -96,6 +99,33 @@ def _run_task_execution_mode(args, config) -> Dict[str, Any]:
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     logger.info("Task queue result saved to %s", result_path)
+
+    if getattr(config, "task_online_rlhf", False):
+        total_tasks = int(result.get("total_tasks") or 0)
+        passed_tasks = int(result.get("passed_tasks") or 0)
+        all_passed = total_tasks > 0 and passed_tasks == total_tasks
+        if all_passed:
+            final_path = (
+                getattr(config, "task_online_final_save_path", None)
+                or os.path.join(config.output_dir, "final_model_task_online_rlhf")
+            )
+            os.makedirs(final_path, exist_ok=True)
+            prev_flag = os.getenv("Z_IMAGE_SAVE_FULL_CHECKPOINTS")
+            os.environ["Z_IMAGE_SAVE_FULL_CHECKPOINTS"] = "1"
+            try:
+                trainer.z_image.save_checkpoint(final_path)
+                logger.info("All tasks passed. Final model saved once to %s", final_path)
+            finally:
+                if prev_flag is None:
+                    os.environ.pop("Z_IMAGE_SAVE_FULL_CHECKPOINTS", None)
+                else:
+                    os.environ["Z_IMAGE_SAVE_FULL_CHECKPOINTS"] = prev_flag
+        else:
+            logger.warning(
+                "Task online RLHF finished but not all tasks passed (passed=%s total=%s). Skip final full model save.",
+                passed_tasks,
+                total_tasks,
+            )
 
     if getattr(config, "task_export_learning_data", False):
         export_summary = export_learning_datasets(
