@@ -34,6 +34,24 @@ def _coerce_labels(value: Any) -> List[str]:
     return []
 
 
+def _resolve_local_model_dir(model_name: str) -> Tuple[str, bool]:
+    if model_name is None:
+        return model_name, False
+    text = str(model_name).strip()
+    if not text:
+        return text, False
+
+    expanded = os.path.expanduser(os.path.expandvars(text))
+    candidates = [expanded]
+    if not os.path.isabs(expanded):
+        candidates.append(os.path.abspath(expanded))
+
+    for path in candidates:
+        if os.path.isdir(path):
+            return os.path.abspath(path), True
+    return expanded, False
+
+
 def _dedupe_list(items: List[str]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -348,16 +366,26 @@ class QwenVLJudge:
         log_raw_output: bool = True,
         strict_schema: bool = False,
     ):
-        self.model_name = model_name
+        resolved_model_name, is_local_dir = _resolve_local_model_dir(model_name)
+        self.model_name = resolved_model_name
         self.device = device
         self.system_prompt = system_prompt
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
-        self.local_files_only = bool(local_files_only) if local_files_only is not None else os.path.isdir(model_name)
+        self.model_path_is_local = bool(is_local_dir)
+        self.local_files_only = bool(local_files_only) if local_files_only is not None else self.model_path_is_local
         self.trust_remote_code = bool(trust_remote_code)
         self.log_raw_output = bool(log_raw_output)
         self.strict_schema = bool(strict_schema)
+
+        looks_like_path = any(ch in str(model_name or "") for ch in ("/", "\\")) or str(model_name or "").startswith(".")
+        if self.local_files_only and not self.model_path_is_local and looks_like_path:
+            raise RuntimeError(
+                "Qwen judge local model path not found: "
+                f"{model_name}. "
+                "Please verify the directory exists in this runtime container."
+            )
 
         self.model, self.processor = self._load_model()
         self.model.eval()
@@ -383,6 +411,9 @@ class QwenVLJudge:
     def _load_model(self):
         processor_kwargs = self._processor_kwargs()
         model_kwargs = self._model_kwargs()
+
+        if self.model_path_is_local:
+            logger.info("Loading Qwen judge from local directory: %s", self.model_name)
 
         prefer_auto = False
         try:
